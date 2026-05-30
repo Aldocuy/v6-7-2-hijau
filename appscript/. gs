@@ -1,0 +1,673 @@
+/**
+ * ════════════════════════════════════════════════════════
+ * 🗄️ ROYYEK VAULT BACKEND - Google Apps Script
+ * Versi: 1.2 (Dengan Offline Sync Queue Support)
+ * ════════════════════════════════════════════════════════
+ * 
+ * 📋 Fitur:
+ * ✅ CRUD Vault & Notes
+ * ✅ Duplicate detection saat create
+ * ✅ Toggle favorite
+ * ✅ Update kategori (drag-drop folder)
+ * ✅ ✅ BARU: Process sync queue untuk data offline
+ * ✅ ✅ BARU: Save folder order untuk drag-drop folder
+ * 
+ * 🔗 Cara Pakai:
+ * 1. Deploy sebagai Web App (Execute as: Me, Access: Anyone)
+ * 2. Copy URL endpoint ke frontend di input "DB:"
+ * 3. Frontend akan otomatis handle sync online/offline
+ * 
+ * ════════════════════════════════════════════════════════
+ */
+
+/* =====================================================
+   📋 KONFIGURASI NAMA SHEET
+   Ganti sesuai nama sheet di Spreadsheet Bos
+===================================================== */
+const SHEET_NAME = "Vault";           // Nama sheet untuk data password/akun
+const NOTES_SHEET_NAME = "Notes";     // Nama sheet untuk data catatan
+
+/* =====================================================
+   🔧 FUNGSI HELPER: GET/CREATE SHEET
+   Otomatis buat sheet + header jika belum ada
+===================================================== */
+function getSheet(sheetTargetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(sheetTargetName);
+
+  if (!sheet) {
+    // Sheet belum ada → buat baru + tambah header
+    sheet = ss.insertSheet(sheetTargetName);
+    
+    if (sheetTargetName === NOTES_SHEET_NAME) {
+      // Header untuk sheet Notes
+      sheet.appendRow(["id", "kategori", "judul", "isi", "tanggal", "favorit"]);
+    } else {
+      // Header untuk sheet Vault
+      sheet.appendRow(["id", "kategori", "nama_aplikasi", "username", "email", "password", "ket", "ket_dua", "created_at", "favorit"]);
+    }
+  }
+  return sheet;
+}
+
+/* =====================================================
+   📤 FUNGSI HELPER: OUTPUT JSON RESPONSE
+   Format response standar untuk frontend
+===================================================== */
+function output(data) {
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/* =====================================================
+   🆔 FUNGSI HELPER: GENERATE UNIQUE ID
+   Format: PREFIX-TIMESTAMP-RANDOM
+   Contoh: VAULT-1703123456789-4821
+===================================================== */
+function generateID(prefix) {
+  return prefix + "-" + Date.now() + "-" + Math.floor(Math.random() * 9999);
+}
+
+/* =====================================================
+   📥 GET HANDLER: FETCH DATA DARI SHEET
+   Parameter: ?type=vault (default) atau ?type=notes
+===================================================== */
+function doGet(e) {
+  try {
+    // Deteksi request untuk notes atau vault
+    const isNotesRequest = (e && e.parameter && e.parameter.type === "notes");
+    const targetTab = isNotesRequest ? NOTES_SHEET_NAME : SHEET_NAME;
+    
+    // Ambil sheet (auto-create jika belum ada)
+    const sheet = getSheet(targetTab);
+    const data = sheet.getDataRange().getValues();
+
+    // Jika sheet kosong (hanya header), return array kosong
+    if (data.length <= 1) {
+      return output([]);
+    }
+
+    // Parse data: convert array of arrays → array of objects
+    const headers = data[0];
+    const result = data.slice(1).map(row => {
+      let obj = {};
+      headers.forEach((h, i) => {
+        // Khusus field 'favorit': convert string ke boolean
+        if (h === "favorit") {
+          obj[h] = String(row[i] || '').toLowerCase() === 'true';
+        } else {
+          obj[h] = row[i];
+        }
+      });
+      return obj;
+    });
+
+    return output(result);
+    
+  } catch(err) {
+    // Handle error: return response error ke frontend
+    return output({ success: false, error: err.toString() });
+  }
+}
+
+/* =====================================================
+   📤 POST HANDLER: ROUTER UNTUK SEMUA ACTION
+   Menerima: create, update, delete, toggle_favorite, 
+             update_category, sync_queue, reorder_folders
+===================================================== */
+function doPost(e) {
+  try {
+    const action = e.parameter.action;
+    const isNotes = e.parameter.data_type === "notes"; 
+    
+    // Router: panggil fungsi sesuai action
+    switch(action) {
+      case "create": return createData(e, isNotes);
+      case "update": return updateData(e, isNotes);
+      case "delete": return deleteData(e, isNotes);
+      case "toggle_favorite": return toggleFavoriteData(e, isNotes);
+      case "update_category": return updateCategoryData(e, isNotes);
+      
+      // ✅ 2 ACTION BARU UNTUK OFFLINE SYNC (v1.2)
+      case "sync_queue": return processSyncQueue(e);        // Process antrian data offline
+      case "reorder_folders": return reorderFolders(e);     // Simpan urutan folder
+      
+      default:
+        return output({ success: false, message: "Invalid action: " + action });
+    }
+    
+  } catch(err) {
+    // Handle error global
+    return output({ success: false, error: err.toString() });
+  }
+}
+
+/* =====================================================
+   ➕ CREATE DATA: Vault atau Notes
+   Termasuk validasi duplikat untuk Vault
+===================================================== */
+function createData(e, isNotes) {
+  if (isNotes) {
+    // ─── CREATE NOTES ───
+    const sheet = getSheet(NOTES_SHEET_NAME);
+    const judul = (e.parameter.judul || "").trim();
+    
+    // Validasi: judul wajib diisi
+    if (judul === "") return output({ success: false, message: "Judul catatan wajib diisi!" });
+
+    const id = generateID("NOTE");
+    sheet.appendRow([
+      id,
+      e.parameter.kategori || "Umum",
+      judul,
+      e.parameter.isi || "",
+      new Date(),
+      "false"  // Default: bukan favorit
+    ]);
+    return output({ success: true, message: "created", id: id });
+    
+  } else {
+    // ─── CREATE VAULT ───
+    const sheet = getSheet(SHEET_NAME);
+    const data = sheet.getDataRange().getValues();
+    
+    // Normalisasi input untuk cek duplikat (case-insensitive)
+    const inputApp = (e.parameter.nama_aplikasi || "").trim().toLowerCase();
+    const inputUser = (e.parameter.username || "").trim().toLowerCase();
+    const inputEmail = (e.parameter.email || "").trim().toLowerCase();
+
+    // Validasi: nama aplikasi wajib diisi
+    if (inputApp === "") return output({ success: false, message: "Nama aplikasi wajib diisi!" });
+
+    // ─── CEK DUPLIKAT ───
+    // Cegah duplikat: aplikasi + (username ATAU email) sama
+    for (let i = 1; i < data.length; i++) {
+      const sheetApp = String(data[i][2] || "").trim().toLowerCase();
+      const sheetUser = String(data[i][3] || "").trim().toLowerCase();
+      const sheetEmail = String(data[i][4] || "").trim().toLowerCase();
+      
+      if (sheetApp === inputApp && (sheetUser === inputUser || sheetEmail === inputEmail)) {
+        return output({ 
+          success: false, 
+          message: "Data Ganda! Akun " + e.parameter.nama_aplikasi + " dengan user/email tersebut sudah ada." 
+        });
+      }
+    }
+
+    // ✅ Tidak duplikat → simpan data baru
+    const id = generateID("VAULT");
+    sheet.appendRow([
+      id, 
+      e.parameter.kategori || "", 
+      e.parameter.nama_aplikasi || "", 
+      e.parameter.username || "", 
+      e.parameter.email || "", 
+      e.parameter.password || "", 
+      e.parameter.ket || "", 
+      e.parameter.ket_dua || "", 
+      new Date(), 
+      "false"  // Default: bukan favorit
+    ]);
+    return output({ success: true, message: "created", id: id });
+  }
+}
+
+/* =====================================================
+   ✏️ UPDATE DATA: Vault atau Notes
+   Update berdasarkan ID yang dikirim frontend
+===================================================== */
+function updateData(e, isNotes) {
+  const targetTab = isNotes ? NOTES_SHEET_NAME : SHEET_NAME;
+  const sheet = getSheet(targetTab);
+  const data = sheet.getDataRange().getValues();
+  const id = e.parameter.id;
+
+  // Cari row berdasarkan ID (kolom A = index 0)
+  for(let i = 1; i < data.length; i++) {
+    if(data[i][0] == id) {
+      if (isNotes) {
+        // Update Notes: kategori, judul, isi (kolom B-D)
+        sheet.getRange(i + 1, 2, 1, 3).setValues([[
+          e.parameter.kategori || "Umum",
+          e.parameter.judul || "",
+          e.parameter.isi || ""
+        ]]);
+      } else {
+        // Update Vault: kategori s/d ket_dua (kolom B-H)
+        sheet.getRange(i + 1, 2, 1, 7).setValues([[
+          e.parameter.kategori || "", 
+          e.parameter.nama_aplikasi || "", 
+          e.parameter.username || "", 
+          e.parameter.email || "", 
+          e.parameter.password || "", 
+          e.parameter.ket || "", 
+          e.parameter.ket_dua || ""
+        ]]);
+      }
+      return output({ success: true, message: "updated" });
+    }
+  }
+  return output({ success: false, message: "ID not found" });
+}
+
+/* =====================================================
+   📁 UPDATE KATEGORI: Untuk Drag-Drop Pindah Folder
+   Hanya update kolom kategori, field lain tetap
+===================================================== */
+function updateCategoryData(e, isNotes) {
+  const targetTab = isNotes ? NOTES_SHEET_NAME : SHEET_NAME;
+  const sheet = getSheet(targetTab);
+  const data = sheet.getDataRange().getValues();
+  const id = e.parameter.id;
+  const newKategori = e.parameter.new_kategori || "Umum";
+  
+  // Kolom kategori ada di kolom ke-2 (index 1, kolom B)
+  for(let i = 1; i < data.length; i++) {
+    if(String(data[i][0]) === String(id)) {
+      // Update hanya kolom kategori
+      sheet.getRange(i + 1, 2).setValue(newKategori);
+      return output({ success: true, message: "Kategori diubah ke: " + newKategori });
+    }
+  }
+  return output({ success: false, message: "ID not found" });
+}
+
+/* =====================================================
+   🗑️ DELETE DATA: Hapus baris berdasarkan ID
+===================================================== */
+function deleteData(e, isNotes) {
+  const targetTab = isNotes ? NOTES_SHEET_NAME : SHEET_NAME;
+  const sheet = getSheet(targetTab);
+  const data = sheet.getDataRange().getValues();
+  const id = e.parameter.id;
+
+  // Cari row berdasarkan ID
+  for(let i = 1; i < data.length; i++) {
+    if(data[i][0] == id) {
+      // Delete row (sheet.deleteRow pakai 1-based index)
+      sheet.deleteRow(i + 1);
+      return output({ success: true, message: "deleted" });
+    }
+  }
+  return output({ success: false, message: "ID not found" });
+}
+
+/* =====================================================
+   ⭐ TOGGLE FAVORITE: Ubah status bintang
+   Return plain text "true"/"false" (bukan JSON)
+===================================================== */
+function toggleFavoriteData(e, isNotes) {
+  const targetTab = isNotes ? NOTES_SHEET_NAME : SHEET_NAME;
+  const sheet = getSheet(targetTab);
+  const data = sheet.getDataRange().getValues();
+  const id = e.parameter.id;
+  
+  // Kolom favorit: Notes=kolom 6, Vault=kolom 10
+  const favColumn = isNotes ? 6 : 10;
+
+  for(let i = 1; i < data.length; i++) {
+    if(String(data[i][0]) === String(id)) {
+      // Baca status sekarang, lalu toggle
+      const statusSekarang = String(data[i][favColumn - 1] || '').toLowerCase() === 'true';
+      const statusBaru = !statusSekarang;
+      
+      // Update ke sheet
+      sheet.getRange(i + 1, favColumn).setValue(statusBaru ? "true" : "false");
+      
+      // Return plain text (sesuai ekspektasi frontend)
+      return ContentService.createTextOutput(statusBaru ? "true" : "false");
+    }
+  }
+  return ContentService.createTextOutput("ID not found");
+}
+
+/* =====================================================
+   ✅ BARU: PROCESS SYNC QUEUE (Offline Data Handler)
+   Dipanggil frontend saat online kembali dengan data pending
+   Parameter: queue_items = JSON array of {action, data_type, ...payload}
+===================================================== */
+function processSyncQueue(e) {
+  try {
+    // Parse queue items dari parameter
+    const queueItems = JSON.parse(e.parameter.queue_items || "[]");
+    
+    // Jika queue kosong, return success
+    if (!Array.isArray(queueItems) || queueItems.length === 0) {
+      return output({ success: true, message: "Queue kosong", processed: 0 });
+    }
+    
+    // Tracker hasil proses
+    let results = { 
+      processed: 0,    // Total item yang diproses
+      succeeded: 0,    // Berhasil
+      failed: 0,       // Gagal
+      errors: []       // Detail error
+    };
+    
+    // ─── PROSES SETIAP ITEM DALAM QUEUE ───
+    queueItems.forEach((item, idx) => {
+      try {
+        // Extract action & payload dari item queue
+        const { action, data_type, id, ...payload } = item;
+        const isNotes = data_type === "notes";
+        
+        // Buat fake event object agar bisa pakai fungsi existing
+        const fakeEvent = { parameter: { action, data_type, id, ...payload } };
+        
+        // ─── ROUTER: Panggil fungsi sesuai action ───
+        switch(action) {
+          case "create": 
+            createData(fakeEvent, isNotes); 
+            break;
+          case "update": 
+            updateData(fakeEvent, isNotes); 
+            break;
+          case "delete": 
+            deleteData(fakeEvent, isNotes); 
+            break;
+          case "toggle_favorite": 
+            toggleFavoriteData(fakeEvent, isNotes); 
+            break;
+          case "update_category": 
+            updateCategoryData(fakeEvent, isNotes); 
+            break;
+          default: 
+            throw new Error("Unknown action: " + action);
+        }
+        
+        // ✅ Item berhasil diproses
+        results.succeeded++;
+        
+      } catch(err) {
+        // ❌ Item gagal: catat error, lanjut ke item berikutnya
+        results.failed++;
+        results.errors.push({ 
+          index: idx, 
+          action: item.action, 
+          id: item.id, 
+          error: err.toString() 
+        });
+        Logger.log("❌ Queue item #" + idx + " failed: " + err.toString());
+      }
+      results.processed++;
+    });
+    
+    // ─── RETURN SUMMARY HASIL ───
+    return output({
+      success: results.failed === 0,  // Success kalau tidak ada yang gagal
+      message: `Processed ${results.processed} items (${results.succeeded} ok, ${results.failed} failed)`,
+      data: results  // Detail untuk debugging frontend
+    });
+    
+  } catch(err) {
+    // Error global: parsing JSON gagal, dll
+    return output({ success: false, error: "Sync queue error: " + err.toString() });
+  }
+}
+
+/* =====================================================
+   ✅ BARU: REORDER FOLDERS (Simpan Urutan Folder)
+   Untuk fitur drag-drop reorder folder di frontend
+   Parameter: data_type + folder_order (JSON array of folder names)
+===================================================== */
+function reorderFolders(e) {
+  try {
+    const dataType = e.parameter.data_type || "vault";
+    const folderOrder = JSON.parse(e.parameter.folder_order || "[]");
+    
+    // ─── SIMPAN URUTAN FOLDER ───
+    // Pakai PropertiesService untuk storage sederhana
+    // Key: "folder_order_vault" atau "folder_order_notes"
+    const propKey = "folder_order_" + dataType;
+    PropertiesService.getScriptProperties().setProperty(propKey, JSON.stringify(folderOrder));
+    
+    // ✅ Return success
+    return output({ 
+      success: true, 
+      message: `Folder order saved for ${dataType}`,
+      data: { 
+        dataType: dataType, 
+        count: folderOrder.length,
+        order: folderOrder  // Echo back untuk konfirmasi
+      }
+    });
+    
+  } catch(err) {
+    // Handle error: JSON parse gagal, dll
+    return output({ success: false, error: "Reorder folders error: " + err.toString() });
+  }
+}
+
+/* =====================================================
+   🔧 ON EDIT TRIGGER: Auto-generate ID & Default Values
+   Jalan otomatis saat user edit sheet manual di Google Sheets
+===================================================== */
+function onEdit(e) {
+  try {
+    const sheet = e.range.getSheet();
+    const currentSheetName = sheet.getName();
+
+    // Hanya proses edit di sheet Vault atau Notes
+    if (currentSheetName !== SHEET_NAME && currentSheetName !== NOTES_SHEET_NAME) return;
+
+    const startRow = e.range.getRow();
+    const numRows = e.range.getNumRows();
+    
+    // Skip jika edit header row (baris 1)
+    if (startRow === 1 && numRows === 1) return;
+
+    const endRow = startRow + numRows - 1;
+    const isNotes = currentSheetName === NOTES_SHEET_NAME;
+
+    // ─── PROSES SETIAP ROW YANG DIEDIT ───
+    for (let r = startRow; r <= endRow; r++) {
+      if (r <= 1) continue;  // Skip header
+
+      // Cek apakah ada konten di field penting (bukan kolom ID)
+      const checkRange = isNotes 
+        ? sheet.getRange(r, 2, 1, 3)   // Notes: kategori, judul, isi
+        : sheet.getRange(r, 2, 1, 7);  // Vault: kategori s/d ket_dua
+      
+      const hasContent = checkRange.getValues()[0].some(v => v !== "");
+
+      if (hasContent) {
+        // ✅ Row ada konten → pastikan ID & default values terisi
+        
+        // Auto-generate ID jika kosong
+        const idCell = sheet.getRange(r, 1);
+        if (idCell.getValue() == "") {
+          idCell.setValue(generateID(isNotes ? "NOTE" : "VAULT"));
+        }
+        
+        if (isNotes) {
+          // Notes: auto-fill tanggal & favorit jika kosong
+          if (sheet.getRange(r, 5).getValue() == "") sheet.getRange(r, 5).setValue(new Date());
+          if (sheet.getRange(r, 6).getValue() == "") sheet.getRange(r, 6).setValue("false");
+        } else {
+          // Vault: auto-fill created_at & favorit jika kosong
+          if (sheet.getRange(r, 9).getValue() == "") sheet.getRange(r, 9).setValue(new Date());
+          if (sheet.getRange(r, 10).getValue() == "") sheet.getRange(r, 10).setValue("false");
+        }
+        
+      } else {
+        // ❌ Row kosong → bersihkan ID & default values
+        sheet.getRange(r, 1).clearContent();  // Clear ID
+        if (isNotes) {
+          sheet.getRange(r, 5).clearContent();  // Clear tanggal
+          sheet.getRange(r, 6).clearContent();  // Clear favorit
+        } else {
+          sheet.getRange(r, 9).clearContent();  // Clear created_at
+          sheet.getRange(r, 10).clearContent(); // Clear favorit
+        }
+      }
+    }
+    
+  } catch(err) {
+    // Log error onEdit (tidak interrupt user)
+    Logger.log("❌ Error pada onEdit: " + err.toString());
+  }
+}
+
+/* =====================================================
+   🧪 FUNGSI TESTING (Opsional - Untuk Debug di Editor)
+   Hapus atau comment out kalau sudah di production
+===================================================== */
+
+/**
+ * Test fetch data vault
+ * Jalankan dari dropdown fungsi di Apps Script Editor
+ */
+function testGetVault() {
+  const e = { parameter: { type: "vault" } };
+  const result = JSON.parse(doGet(e).getContent());
+  Logger.log("✅ Get Vault: " + result.length + " items");
+  Logger.log(result.slice(0, 2));  // Log 2 item pertama
+}
+
+/**
+ * Test fetch data notes
+ */
+function testGetNotes() {
+  const e = { parameter: { type: "notes" } };
+  const result = JSON.parse(doGet(e).getContent());
+  Logger.log("✅ Get Notes: " + result.length + " items");
+}
+
+/**
+ * Test create vault entry
+ */
+function testCreateVault() {
+  const e = {
+    parameter: {
+      action: "create",
+      data_type: "vault",
+      nama_aplikasi: "Test App " + Date.now(),
+      username: "testuser",
+      email: "test@example.com",
+      password: "password123",
+      kategori: "Testing"
+    }
+  };
+  const result = JSON.parse(doPost(e).getContent());
+  Logger.log("✅ Create Vault: " + JSON.stringify(result));
+}
+
+/**
+ * Test sync queue (simulasi data offline)
+ */
+function testSyncQueue() {
+  const e = {
+    parameter: {
+      action: "sync_queue",
+      queue_items: JSON.stringify([
+        {
+          action: "create",
+          data_type: "vault",
+          nama_aplikasi: "Offline Test " + Date.now(),
+          username: "offline_user",
+          email: "offline@example.com",
+          password: "secret123",
+          kategori: "Offline"
+        },
+        {
+          action: "update_category",
+          data_type: "vault",
+          id: "VAULT-123456-7890",  // Ganti dengan ID valid untuk test
+          new_kategori: "Updated Category"
+        }
+      ])
+    }
+  };
+  const result = JSON.parse(doPost(e).getContent());
+  Logger.log("✅ Sync Queue: " + JSON.stringify(result));
+}
+
+/**
+ * Test reorder folders
+ */
+function testReorderFolders() {
+  const e = {
+    parameter: {
+      action: "reorder_folders",
+      data_type: "vault",
+      folder_order: JSON.stringify(["Medsos", "Keuangan", "Umum", "Testing", "Lainnya"])
+    }
+  };
+  const result = JSON.parse(doPost(e).getContent());
+  Logger.log("✅ Reorder Folders: " + JSON.stringify(result));
+}
+
+/**
+ * Test toggle favorite
+ */
+function testToggleFavorite() {
+  const e = {
+    parameter: {
+      action: "toggle_favorite",
+      data_type: "vault",
+      id: "VAULT-123456-7890"  // Ganti dengan ID valid
+    }
+  };
+  const result = doPost(e).getContent();
+  Logger.log("✅ Toggle Favorite: " + result);
+}
+
+/* =====================================================
+   📚 DOKUMENTASI API (Untuk Referensi Developer)
+===================================================== */
+
+/**
+ * ════════════════════════════════════════════════════════
+ * 📡 API ENDPOINTS
+ * ════════════════════════════════════════════════════════
+ * 
+ * 🔗 Base URL: https://script.google.com/macros/s/XXXX/exec
+ * 
+ * ─── GET REQUESTS (Fetch Data) ─────────────────────────
+ * GET /exec
+ *   → Return semua data Vault (default)
+ * 
+ * GET /exec?type=notes
+ *   → Return semua data Notes
+ * 
+ * Response format:
+ * {
+ *   "success": true,
+ *   "data": [ {id, kategori, ...}, ... ]
+ * }
+ * 
+ * ─── POST REQUESTS (Mutations) ─────────────────────────
+ * Semua POST pakai Content-Type: application/x-www-form-urlencoded
+ * 
+ * ➕ CREATE:
+ * action=create&data_type=vault&nama_aplikasi=...&username=...&...
+ * 
+ * ✏️ UPDATE:
+ * action=update&data_type=vault&id=VAULT-xxx&nama_aplikasi=...&...
+ * 
+ * 🗑️ DELETE:
+ * action=delete&data_type=vault&id=VAULT-xxx
+ * 
+ * ⭐ TOGGLE FAVORITE:
+ * action=toggle_favorite&data_type=vault&id=VAULT-xxx
+ * → Return plain text: "true" atau "false"
+ * 
+ * 📁 UPDATE CATEGORY (Drag-drop folder):
+ * action=update_category&data_type=vault&id=VAULT-xxx&new_kategori=Baru
+ * 
+ * 🔄 SYNC QUEUE (Offline data):
+ * action=sync_queue&queue_items=[{action:"create",data_type:"vault",...},...]
+ * 
+ * 📊 REORDER FOLDERS:
+ * action=reorder_folders&data_type=vault&folder_order=["A","B","C"]
+ * 
+ * ─── RESPONSE FORMAT ───────────────────────────────────
+ * Success:
+ * { "success": true, "message": "...", "data": {...}, "id": "..." }
+ * 
+ * Error:
+ * { "success": false, "error": "Pesan error", "message": "..." }
+ * 
+ * ════════════════════════════════════════════════════════
+ */
